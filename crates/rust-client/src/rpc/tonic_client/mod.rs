@@ -54,6 +54,7 @@ use crate::rpc::{AccountStateAt, generated as proto};
 mod api_client;
 mod retry;
 
+use api_client::ExtraHeader;
 use api_client::api_client_wrapper::ApiClient;
 
 /// Tracks the pagination state for block-driven endpoints.
@@ -152,6 +153,10 @@ pub struct GrpcClient {
     max_retries: u32,
     /// Fallback retry interval in milliseconds when no `retry-after` header is present.
     retry_interval_ms: u64,
+    /// Extra request headers injected into every outbound gRPC call (in addition to the
+    /// standard `accept` header). Used to attach caller-supplied metadata such as an
+    /// `authorization` bearer token when talking to a gateway in front of the node.
+    extra_headers: Vec<ExtraHeader>,
 }
 
 impl GrpcClient {
@@ -166,6 +171,7 @@ impl GrpcClient {
             limits: RwLock::new(None),
             max_retries: retry::DEFAULT_MAX_RETRIES,
             retry_interval_ms: retry::DEFAULT_RETRY_INTERVAL_MS,
+            extra_headers: Vec::new(),
         }
     }
 
@@ -185,6 +191,35 @@ impl GrpcClient {
         self
     }
 
+    /// Adds a caller-supplied request header that will be injected into every outbound gRPC
+    /// call made by this client, alongside the standard `accept` header.
+    ///
+    /// Headers are applied in insertion order; calling this method twice with the same key
+    /// overwrites the earlier value.
+    ///
+    /// Validation of the `value` against
+    /// [`AsciiMetadataValue`](tonic::metadata::AsciiMetadataValue) is deferred to connection
+    /// time: invalid values surface as
+    /// [`RpcError::ConnectionError`](crate::rpc::RpcError::ConnectionError) on the first request.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use miden_client::rpc::{Endpoint, GrpcClient};
+    /// let endpoint = Endpoint::new("https".into(), "node.example".into(), Some(443));
+    /// let client = GrpcClient::new(&endpoint, 10_000)
+    ///     .with_header("authorization", format!("Bearer {}", "<api-key>"));
+    /// ```
+    #[must_use]
+    pub fn with_header(mut self, key: &'static str, value: String) -> Self {
+        if let Some(existing) = self.extra_headers.iter_mut().find(|(k, _)| *k == key) {
+            existing.1 = value;
+        } else {
+            self.extra_headers.push((key, value));
+        }
+        self
+    }
+
     /// Takes care of establishing the RPC connection if not connected yet. It ensures that the
     /// `rpc_api` field is initialized and returns a write guard to it.
     async fn ensure_connected(&self) -> Result<ApiClient, RpcError> {
@@ -199,9 +234,13 @@ impl GrpcClient {
     /// genesis commitment.
     async fn connect(&self) -> Result<(), RpcError> {
         let genesis_commitment = *self.genesis_commitment.read();
-        let new_client =
-            ApiClient::new_client(self.endpoint.clone(), self.timeout_ms, genesis_commitment)
-                .await?;
+        let new_client = ApiClient::new_client(
+            self.endpoint.clone(),
+            self.timeout_ms,
+            genesis_commitment,
+            self.extra_headers.clone(),
+        )
+        .await?;
         let mut client = self.client.write();
         client.replace(new_client);
 
@@ -252,11 +291,15 @@ impl GrpcClient {
     /// Fetches RPC status without injecting an Accept header.
     ///
     /// This instantiates a separate API client without the Accept interceptor, so it does not
-    /// reuse the primary gRPC client.
+    /// reuse the primary gRPC client. Any caller-supplied [`with_header`](Self::with_header)
+    /// entries are still forwarded so gateway authentication keeps working.
     pub async fn get_status_unversioned(&self) -> Result<RpcStatusInfo, RpcError> {
-        let mut rpc_api =
-            ApiClient::new_client_without_accept_header(self.endpoint.clone(), self.timeout_ms)
-                .await?;
+        let mut rpc_api = ApiClient::new_client_without_accept_header(
+            self.endpoint.clone(),
+            self.timeout_ms,
+            self.extra_headers.clone(),
+        )
+        .await?;
         rpc_api
             .status(())
             .await
@@ -481,7 +524,7 @@ impl NodeRpcClient for GrpcClient {
         // If not connected, the commitment will be used when connect() is called.
         let mut client_guard = self.client.write();
         if let Some(client) = client_guard.as_mut() {
-            client.set_genesis_commitment(commitment);
+            client.set_genesis_commitment(commitment)?;
         }
 
         Ok(())
@@ -1122,6 +1165,7 @@ mod tests {
     use miden_protocol::block::BlockNumber;
 
     use super::{BlockPagination, GrpcClient, PaginationResult};
+    use crate::alloc::string::ToString;
     use crate::rpc::{Endpoint, NodeRpcClient, RpcError};
 
     fn assert_send_sync<T: Send + Sync>() {}
@@ -1242,6 +1286,64 @@ mod tests {
         client.set_genesis_commitment(commitment).await.unwrap();
 
         assert_eq!(client.genesis_commitment.read().unwrap(), commitment);
+        assert!(client.client.read().as_ref().is_some());
+    }
+
+    #[test]
+    fn with_header_stores_caller_supplied_metadata() {
+        let endpoint = &Endpoint::devnet();
+        let client = GrpcClient::new(endpoint, 10000)
+            .with_header("authorization", "Bearer token-one".to_string());
+
+        assert_eq!(client.extra_headers.len(), 1);
+        assert_eq!(client.extra_headers[0].0, "authorization");
+        assert_eq!(client.extra_headers[0].1, "Bearer token-one");
+    }
+
+    #[test]
+    fn with_header_overwrites_same_key_in_place() {
+        let endpoint = &Endpoint::devnet();
+        let client = GrpcClient::new(endpoint, 10000)
+            .with_header("authorization", "Bearer token-one".to_string())
+            .with_header("x-request-id", "abc-123".to_string())
+            .with_header("authorization", "Bearer token-two".to_string());
+
+        // Same key stays in its original slot so `accept_header_interceptor` applies headers
+        // in a deterministic insertion order.
+        assert_eq!(client.extra_headers.len(), 2);
+        assert_eq!(client.extra_headers[0].0, "authorization");
+        assert_eq!(client.extra_headers[0].1, "Bearer token-two");
+        assert_eq!(client.extra_headers[1].0, "x-request-id");
+    }
+
+    #[tokio::test]
+    async fn with_header_surfaces_invalid_ascii_value_at_connect_time() {
+        // Values containing control characters are rejected by `AsciiMetadataValue`. The
+        // fluent `with_header` API defers this check to connection time, so the error must
+        // surface as a `ConnectionError` on the first request.
+        let endpoint = &Endpoint::devnet();
+        let client = GrpcClient::new(endpoint, 10000)
+            .with_header("authorization", "Bearer bad\nvalue".to_string());
+
+        let err = client.connect().await.expect_err("expected invalid header to fail connect");
+        assert!(
+            matches!(err, RpcError::ConnectionError(_)),
+            "expected ConnectionError, got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn with_header_is_preserved_across_set_genesis_commitment() {
+        let endpoint = &Endpoint::devnet();
+        let client = GrpcClient::new(endpoint, 10000)
+            .with_header("authorization", "Bearer token".to_string());
+        client.connect().await.unwrap();
+
+        client.set_genesis_commitment(Word::default()).await.unwrap();
+
+        // Rebuilding the interceptor after a genesis update must not drop caller headers.
+        assert_eq!(client.extra_headers.len(), 1);
+        assert_eq!(client.extra_headers[0].0, "authorization");
         assert!(client.client.read().as_ref().is_some());
     }
 }
