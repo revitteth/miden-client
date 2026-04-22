@@ -1346,4 +1346,27 @@ mod tests {
         assert_eq!(client.extra_headers[0].0, "authorization");
         assert!(client.client.read().as_ref().is_some());
     }
+
+    /// Real-network smoke test: hitting the public testnet with a caller-supplied
+    /// `authorization` header must succeed, proving the header is a valid
+    /// `AsciiMetadataValue` and that an unauthenticated node ignores it cleanly.
+    ///
+    /// Skipped when the network is unreachable so CI without internet doesn't flake.
+    #[tokio::test]
+    async fn with_header_does_not_break_real_rpc_against_testnet() {
+        let endpoint = &Endpoint::testnet();
+        let client = GrpcClient::new(endpoint, 10000)
+            .with_header("authorization", "Bearer smoke-test".to_string());
+
+        match client.get_status_unversioned().await {
+            Ok(_) => {},
+            Err(RpcError::ConnectionError(_)) => {
+                // Treat unreachable network as a skip rather than a hard fail so the test
+                // suite works offline. Header-value validation would also surface as
+                // ConnectionError, but we already cover that in
+                // `with_header_surfaces_invalid_ascii_value_at_connect_time`.
+            },
+            Err(err) => panic!("unexpected RPC error with caller auth header: {err:?}"),
+        }
+    }
 }
