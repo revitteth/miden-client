@@ -199,8 +199,17 @@ impl GrpcClient {
     ///
     /// Validation of the `value` against
     /// [`AsciiMetadataValue`](tonic::metadata::AsciiMetadataValue) is deferred to connection
-    /// time: invalid values surface as
-    /// [`RpcError::ConnectionError`](crate::rpc::RpcError::ConnectionError) on the first request.
+    /// time (printable ASCII plus tab only — `HeaderValue::from_str` semantics): invalid
+    /// values surface as [`RpcError::ConnectionError`](crate::rpc::RpcError::ConnectionError)
+    /// on the first request, so CR/LF header-injection attempts are rejected.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `key` is `"accept"`. The Miden RPC server relies on this header for API
+    /// version + genesis commitment negotiation, and letting callers overwrite it would
+    /// silently break compatibility checks (see [`AcceptHeaderError`]).
+    ///
+    /// [`AcceptHeaderError`]: crate::rpc::AcceptHeaderError
     ///
     /// # Example
     ///
@@ -212,6 +221,11 @@ impl GrpcClient {
     /// ```
     #[must_use]
     pub fn with_header(mut self, key: &'static str, value: String) -> Self {
+        assert_ne!(
+            key, "accept",
+            "`accept` is reserved for Miden API version negotiation; overriding it would \
+             disable server-side version/genesis checks",
+        );
         if let Some(existing) = self.extra_headers.iter_mut().find(|(k, _)| *k == key) {
             existing.1 = value;
         } else {
@@ -1348,25 +1362,38 @@ mod tests {
     }
 
     /// Real-network smoke test: hitting the public testnet with a caller-supplied
-    /// `authorization` header must succeed, proving the header is a valid
-    /// `AsciiMetadataValue` and that an unauthenticated node ignores it cleanly.
+    /// `authorization` header must return a real [`RpcStatusInfo`], proving the header is
+    /// a valid [`AsciiMetadataValue`](tonic::metadata::AsciiMetadataValue) on the wire and
+    /// that an unauthenticated node ignores it cleanly.
     ///
-    /// Skipped when the network is unreachable so CI without internet doesn't flake.
+    /// `#[ignore]`d by default so offline CI doesn't fail; run with
+    /// `cargo test -- --ignored with_header_does_not_break_real_rpc_against_testnet` when
+    /// validating against the real network. The interceptor-level test
+    /// (`api_client::tests::interceptor_injects_caller_supplied_headers_onto_request`)
+    /// already proves the header reaches outbound request metadata without needing the
+    /// network.
     #[tokio::test]
+    #[ignore = "requires network access to public testnet"]
     async fn with_header_does_not_break_real_rpc_against_testnet() {
         let endpoint = &Endpoint::testnet();
-        let client = GrpcClient::new(endpoint, 10000)
+        let client = GrpcClient::new(endpoint, 10_000)
             .with_header("authorization", "Bearer smoke-test".to_string());
 
-        match client.get_status_unversioned().await {
-            Ok(_) => {},
-            Err(RpcError::ConnectionError(_)) => {
-                // Treat unreachable network as a skip rather than a hard fail so the test
-                // suite works offline. Header-value validation would also surface as
-                // ConnectionError, but we already cover that in
-                // `with_header_surfaces_invalid_ascii_value_at_connect_time`.
-            },
-            Err(err) => panic!("unexpected RPC error with caller auth header: {err:?}"),
-        }
+        let status = client
+            .get_status_unversioned()
+            .await
+            .expect("testnet status with caller auth header must succeed");
+        assert!(!status.version.is_empty(), "status must include a server version");
+    }
+
+    #[test]
+    #[should_panic(expected = "`accept` is reserved for Miden API version negotiation")]
+    fn with_header_panics_on_reserved_accept_key() {
+        // Overriding `accept` would disable server-side API version + genesis commitment
+        // negotiation. The panic makes this a loud compile/run-time failure rather than a
+        // silent correctness hazard.
+        let endpoint = &Endpoint::devnet();
+        let _ =
+            GrpcClient::new(endpoint, 10_000).with_header("accept", "application/json".to_string());
     }
 }
